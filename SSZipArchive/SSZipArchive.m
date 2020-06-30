@@ -747,6 +747,251 @@ BOOL _fileIsSymbolicLink(const unz_file_info *fileInfo);
     return success;
 }
 
++ (BOOL)unzipFileToMemoryAtPath:(NSString *)path
+     preserveAttributes:(BOOL)preserveAttributes
+               password:(nullable NSString *)password
+                  error:(NSError **)error
+               delegate:(nullable id<SSZipArchiveDelegate>)delegate
+               completionHandler:(void (^_Nullable)(NSData *data, BOOL succeeded))completionHandler
+{
+    
+    // Guard against empty strings
+    if (path.length == 0)
+    {
+        NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"received invalid argument(s)"};
+        NSError *err = [NSError errorWithDomain:SSZipArchiveErrorDomain code:SSZipArchiveErrorCodeInvalidArguments userInfo:userInfo];
+        if (error)
+        {
+            *error = err;
+        }
+        if (completionHandler)
+        {
+            completionHandler(nil, NO);
+        }
+        return NO;
+    }
+    
+    // Begin opening
+    zipFile zip = unzOpen(path.fileSystemRepresentation);
+    if (zip == NULL)
+    {
+        NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"failed to open zip file"};
+        NSError *err = [NSError errorWithDomain:SSZipArchiveErrorDomain code:SSZipArchiveErrorCodeFailedOpenZipFile userInfo:userInfo];
+        if (error)
+        {
+            *error = err;
+        }
+        if (completionHandler)
+        {
+            completionHandler(nil, NO);
+        }
+        return NO;
+    }
+    
+    
+    
+    NSDictionary * fileAttributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    unsigned long long fileSize = [[fileAttributes objectForKey:NSFileSize] unsignedLongLongValue];
+    unsigned long long currentPosition = 0;
+    
+    unz_global_info globalInfo = {};
+    unzGetGlobalInfo(zip, &globalInfo);
+    
+    // Begin unzipping
+    int ret = 0;
+    ret = unzGoToFirstFile(zip);
+    if (ret != UNZ_OK && ret != MZ_END_OF_LIST)
+    {
+        NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"failed to open first file in zip file"};
+        NSError *err = [NSError errorWithDomain:SSZipArchiveErrorDomain code:SSZipArchiveErrorCodeFailedOpenFileInZip userInfo:userInfo];
+        if (error)
+        {
+            *error = err;
+        }
+        if (completionHandler)
+        {
+            completionHandler(nil, NO);
+        }
+        unzClose(zip);
+        return NO;
+    }
+    
+    BOOL success = YES;
+    BOOL canceled = NO;
+    int crc_ret = 0;
+    unsigned char buffer[4096] = {0};
+    NSMutableArray<NSDictionary *> *directoriesModificationDates = [[NSMutableArray alloc] init];
+    NSMutableData *data= [[NSMutableData alloc] init];
+    
+    // Message delegate
+    if ([delegate respondsToSelector:@selector(zipArchiveWillUnzipArchiveAtPath:zipInfo:)]) {
+        [delegate zipArchiveWillUnzipArchiveAtPath:path zipInfo:globalInfo];
+    }
+    if ([delegate respondsToSelector:@selector(zipArchiveProgressEvent:total:)]) {
+        [delegate zipArchiveProgressEvent:currentPosition total:fileSize];
+    }
+    
+    NSInteger currentFileNumber = -1;
+    NSError *unzippingError;
+    do {
+        currentFileNumber++;
+        if (ret == MZ_END_OF_LIST) {
+            break;
+        }
+        @autoreleasepool {
+            if (password.length == 0) {
+                ret = unzOpenCurrentFile(zip);
+            } else {
+                ret = unzOpenCurrentFilePassword(zip, [password cStringUsingEncoding:NSUTF8StringEncoding]);
+            }
+            
+            if (ret != UNZ_OK) {
+                unzippingError = [NSError errorWithDomain:@"SSZipArchiveErrorDomain" code:SSZipArchiveErrorCodeFailedOpenFileInZip userInfo:@{NSLocalizedDescriptionKey: @"failed to open file in zip file"}];
+                success = NO;
+                break;
+            }
+            
+            // Reading data and write to file
+            unz_file_info fileInfo;
+            memset(&fileInfo, 0, sizeof(unz_file_info));
+            
+            ret = unzGetCurrentFileInfo(zip, &fileInfo, NULL, 0, NULL, 0, NULL, 0);
+            if (ret != UNZ_OK) {
+                unzippingError = [NSError errorWithDomain:@"SSZipArchiveErrorDomain" code:SSZipArchiveErrorCodeFileInfoNotLoadable userInfo:@{NSLocalizedDescriptionKey: @"failed to retrieve info for file"}];
+                success = NO;
+                unzCloseCurrentFile(zip);
+                break;
+            }
+            
+            currentPosition += fileInfo.compressed_size;
+            
+            // Message delegate
+            if ([delegate respondsToSelector:@selector(zipArchiveShouldUnzipFileAtIndex:totalFiles:archivePath:fileInfo:)]) {
+                if (![delegate zipArchiveShouldUnzipFileAtIndex:currentFileNumber
+                                                     totalFiles:(NSInteger)globalInfo.number_entry
+                                                    archivePath:path
+                                                       fileInfo:fileInfo]) {
+                    success = NO;
+                    canceled = YES;
+                    break;
+                }
+            }
+            if ([delegate respondsToSelector:@selector(zipArchiveWillUnzipFileAtIndex:totalFiles:archivePath:fileInfo:)]) {
+                [delegate zipArchiveWillUnzipFileAtIndex:currentFileNumber totalFiles:(NSInteger)globalInfo.number_entry
+                                             archivePath:path fileInfo:fileInfo];
+            }
+            if ([delegate respondsToSelector:@selector(zipArchiveProgressEvent:total:)]) {
+                [delegate zipArchiveProgressEvent:(NSInteger)currentPosition total:(NSInteger)fileSize];
+            }
+            
+            char *filename = (char *)malloc(fileInfo.size_filename + 1);
+            if (filename == NULL)
+            {
+                success = NO;
+                break;
+            }
+            
+            unzGetCurrentFileInfo(zip, &fileInfo, filename, fileInfo.size_filename + 1, NULL, 0, NULL, 0);
+            filename[fileInfo.size_filename] = '\0';
+            
+            BOOL fileIsSymbolicLink = _fileIsSymbolicLink(&fileInfo);
+            
+            NSString * strPath = [SSZipArchive _filenameStringWithCString:filename
+                                                          version_made_by:fileInfo.version
+                                                     general_purpose_flag:fileInfo.flag
+                                                                     size:fileInfo.size_filename];
+            if ([strPath hasPrefix:@"__MACOSX/"]) {
+                // ignoring resource forks: https://superuser.com/questions/104500/what-is-macosx-folder
+                unzCloseCurrentFile(zip);
+                ret = unzGoToNextFile(zip);
+                free(filename);
+                continue;
+            }
+            
+            // Check if it contains directory
+            BOOL isDirectory = NO;
+            if (filename[fileInfo.size_filename-1] == '/' || filename[fileInfo.size_filename-1] == '\\') {
+                isDirectory = YES;
+            }
+            free(filename);
+            
+            // Sanitize paths in the file name.
+            strPath = [strPath _sanitizedPath];
+            if (!strPath.length) {
+                // if filename data is unsalvageable, we default to currentFileNumber
+                strPath = @(currentFileNumber).stringValue;
+            }
+            
+            if (isDirectory && !fileIsSymbolicLink) {
+                // nothing to read/write for a directory
+            } else if (!fileIsSymbolicLink) {
+                // ensure we are not creating stale file entries
+                int readBytes = 0;
+                while ((readBytes = unzReadCurrentFile(zip, buffer, 4096)) > 0) {
+                    [data appendBytes:buffer length:readBytes];
+                }
+            }
+            
+            crc_ret = unzCloseCurrentFile(zip);
+            if (crc_ret == MZ_CRC_ERROR) {
+                // CRC ERROR
+                success = NO;
+                break;
+            }
+            ret = unzGoToNextFile(zip);
+        }
+            // Message delegate
+    } while (ret == UNZ_OK && success);
+    
+    // Close
+    unzClose(zip);
+    // The process of decompressing the .zip archive causes the modification times on the folders
+    // to be set to the present time. So, when we are done, they need to be explicitly set.
+    // set the modification date on all of the directories.
+    if (success && preserveAttributes) {
+        NSError * err = nil;
+        for (NSDictionary * d in directoriesModificationDates) {
+            if (![[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [d objectForKey:@"modDate"]} ofItemAtPath:[d objectForKey:@"path"] error:&err]) {
+                NSLog(@"[SSZipArchive] Set attributes failed for directory: %@.", [d objectForKey:@"path"]);
+            }
+            if (err) {
+                NSLog(@"[SSZipArchive] Error setting directory file modification date attribute: %@", err.localizedDescription);
+            }
+        }
+    }
+    
+    if (!canceled && [delegate respondsToSelector:@selector(zipArchiveProgressEvent:total:)]) {
+        [delegate zipArchiveProgressEvent:fileSize total:fileSize];
+    }
+    
+    NSError *retErr = nil;
+    if (crc_ret == MZ_CRC_ERROR)
+    {
+        NSDictionary *userInfo = @{NSLocalizedDescriptionKey: @"crc check failed for file"};
+        retErr = [NSError errorWithDomain:SSZipArchiveErrorDomain code:SSZipArchiveErrorCodeFileInfoNotLoadable userInfo:userInfo];
+    }
+    
+    if (error) {
+        if (unzippingError) {
+            *error = unzippingError;
+        }
+        else {
+            *error = retErr;
+        }
+    }
+    if (completionHandler)
+    {
+        if (unzippingError) {
+            completionHandler(nil, NO);
+        }
+        else
+        {
+            completionHandler(data, YES);
+        }
+    }
+    return success;
+}
+
 #pragma mark - Zipping
 + (BOOL)createZipFileAtPath:(NSString *)path withFilesAtPaths:(NSArray<NSString *> *)paths
 {

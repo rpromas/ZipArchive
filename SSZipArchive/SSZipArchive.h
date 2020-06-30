@@ -83,6 +83,13 @@ typedef NS_ENUM(NSInteger, SSZipArchiveErrorCode) {
         progressHandler:(void (^_Nullable)(NSString *entry, unz_file_info zipInfo, long entryNumber, long total))progressHandler
       completionHandler:(void (^_Nullable)(NSString *path, BOOL succeeded, NSError * _Nullable error))completionHandler;
 
++ (BOOL)unzipFileToMemoryAtPath:(NSString *)path
+preserveAttributes:(BOOL)preserveAttributes
+          password:(nullable NSString *)password
+             error:(NSError **)error
+          delegate:(nullable id<SSZipArchiveDelegate>)delegate
+        completionHandler:(void (^_Nullable)(NSData *data, BOOL succeeded))completionHandler;
+
 // Zip
 // default compression level is Z_DEFAULT_COMPRESSION (from "zlib.h")
 // keepParentDirectory: if YES, then unzipping will give `directoryName/fileName`. If NO, then unzipping will just give `fileName`. Default is NO.
